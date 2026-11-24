@@ -1,0 +1,1 @@
+A market stall management system for tracking stall assignments, vendor records, lease payments, and occupancy status.
