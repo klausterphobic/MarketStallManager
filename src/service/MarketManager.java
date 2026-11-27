@@ -5,6 +5,8 @@ import exception.*;
 import model.*;
 
 import java.time.LocalDate;
+import java.time.YearMonth;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 
 public class MarketManager {
@@ -12,12 +14,17 @@ public class MarketManager {
     private final List<User> users = new ArrayList<>();
     private final List<Vendor> vendors = new ArrayList<>();
     private final List<Stall> stalls = new ArrayList<>();
+    private final List<Payment> payments = new ArrayList<>();
+    private final List<Permit> permits = new ArrayList<>();
 
     public MarketManager() throws DataFileException {
         this.fileHandler = new FileHandler();
         users.addAll(fileHandler.loadUsers());
         stalls.addAll(fileHandler.loadStalls());
         vendors.addAll(fileHandler.loadVendors());
+        payments.addAll(fileHandler.loadPayments());
+        permits.addAll(fileHandler.loadPermits());
+        recalculatePaidUntil();
     }
 
     // ---------------------------------------------------------------- login
@@ -41,6 +48,8 @@ public class MarketManager {
     public List<User> getUsers() { return users; }
     public List<Vendor> getVendors() { return vendors; }
     public List<Stall> getStalls() { return stalls; }
+    public List<Payment> getPayments() { return payments; }
+    public List<Permit> getPermits() { return permits; }
 
     public Vendor findVendor(String id) {
         for (Vendor v : vendors) if (v.getId().equals(id)) return v;
@@ -49,6 +58,16 @@ public class MarketManager {
 
     public Stall findStall(String id) {
         for (Stall s : stalls) if (s.getId().equals(id)) return s;
+        return null;
+    }
+
+    public Payment findPayment(String id) {
+        for (Payment p : payments) if (p.getId().equals(id)) return p;
+        return null;
+    }
+
+    public Permit findPermit(String id) {
+        for (Permit p : permits) if (p.getId().equals(id)) return p;
         return null;
     }
 
@@ -90,8 +109,12 @@ public class MarketManager {
             }
         }
         vendors.remove(v);
+        payments.removeIf(p -> p.getVendorId().equals(v.getId()));
+        permits.removeIf(p -> p.getVendorId().equals(v.getId()));
         fileHandler.saveVendors(vendors);
         fileHandler.saveStalls(stalls);
+        fileHandler.savePayments(payments);
+        fileHandler.savePermits(permits);
     }
 
     private void validateVendorFields(String name, String contact, String business)
@@ -190,6 +213,114 @@ public class MarketManager {
         };
     }
 
+    // ------------------------------------------------------------- payments
+
+    public Receipt recordPayment(User actor, String vendorId, double amount, LocalDate paymentDate,
+                                 String periodCovered, LocalDate paidUntil)
+            throws InvalidInputException, DataFileException {
+        Vendor v = findVendor(vendorId);
+        if (v == null) throw new InvalidInputException("Please select a vendor.");
+        if (amount <= 0) throw new InvalidInputException("Amount must be greater than zero.");
+        if (paymentDate == null) throw new InvalidInputException("Payment date is required.");
+        if (paidUntil == null) throw new InvalidInputException("Paid-until date is required.");
+        if (paidUntil.isBefore(paymentDate))
+            throw new InvalidInputException("Paid-until date cannot be before the payment date.");
+        if (periodCovered == null || periodCovered.isBlank())
+            throw new InvalidInputException("Period covered is required.");
+        String id = nextId("P", payments.stream().map(Payment::getId).toList());
+        Payment p = new Payment(id, vendorId, amount, paymentDate, clean(periodCovered), paidUntil);
+        payments.add(p);
+        if (v.getPaidUntil() == null || paidUntil.isAfter(v.getPaidUntil())) {
+            v.setPaidUntil(paidUntil);
+        }
+        fileHandler.savePayments(payments);
+        String text = formatReceipt(actor, p, v);
+        String fileName = "receipt_" + p.getId() + "_" + LocalDate.now() + ".txt";
+        String path = fileHandler.saveReceipt(text, fileName);
+        return new Receipt(text, path);
+    }
+
+    public void deletePayment(User actor, Payment p) throws InvalidInputException, DataFileException {
+        if (!actor.canDelete()) throw new InvalidInputException("Staff accounts cannot delete records.");
+        if (p == null) return;
+        payments.remove(p);
+        recalculatePaidUntil();
+        fileHandler.savePayments(payments);
+    }
+
+    public String viewReceipt(User actor, Payment p) {
+        Vendor v = findVendor(p.getVendorId());
+        return formatReceipt(actor, p, v);
+    }
+
+    private String formatReceipt(User actor, Payment p, Vendor v) {
+        Stall s = v == null || v.getStallId() == null ? null : findStall(v.getStallId());
+        StringBuilder sb = new StringBuilder();
+        sb.append("========================================\n");
+        sb.append("   LOCAL PUBLIC MARKET OFFICE\n");
+        sb.append("   Stall Rental Payment Receipt\n");
+        sb.append("========================================\n");
+        sb.append(String.format("Receipt No. : %s%n", p.getId()));
+        sb.append(String.format("Date        : %s%n", p.getPaymentDate()));
+        sb.append(String.format("Cashier     : %s%n", actor.getFullName()));
+        sb.append("----------------------------------------\n");
+        sb.append(String.format("Vendor      : %s - %s%n", v == null ? "" : v.getId(), v == null ? "" : v.getName()));
+        sb.append(String.format("Stall       : %s%n", s == null ? "No stall assigned" : s.getId() + " (" + s.getSection() + ")"));
+        sb.append(String.format("Business    : %s%n", v == null ? "" : v.getBusiness()));
+        sb.append(String.format("Period      : %s%n", p.getPeriodCovered()));
+        sb.append(String.format("Paid Until  : %s%n", p.getPaidUntil()));
+        sb.append("----------------------------------------\n");
+        sb.append(String.format("Amount Paid : PHP %,.2f%n", p.getAmount()));
+        sb.append("========================================\n");
+        sb.append("This is a system-generated receipt.\n");
+        return sb.toString();
+    }
+
+    // -------------------------------------------------------------- permits
+
+    public Permit addPermit(String vendorId, String type, String permitNumber,
+                            LocalDate issueDate, LocalDate expiryDate)
+            throws InvalidInputException, DataFileException {
+        if (findVendor(vendorId) == null) throw new InvalidInputException("Please select a vendor.");
+        if (permitNumber == null || permitNumber.isBlank())
+            throw new InvalidInputException("Permit number is required.");
+        if (issueDate == null || expiryDate == null)
+            throw new InvalidInputException("Issue and expiry dates are required.");
+        if (!expiryDate.isAfter(issueDate))
+            throw new InvalidInputException("Expiry date must be after the issue date.");
+        String id = nextId("PM", permits.stream().map(Permit::getId).toList());
+        Permit p;
+        if ("SANITARY".equals(type)) {
+            p = new SanitaryPermit(id, vendorId, clean(permitNumber), issueDate, expiryDate);
+        } else {
+            p = new BusinessPermit(id, vendorId, clean(permitNumber), issueDate, expiryDate);
+        }
+        permits.add(p);
+        fileHandler.savePermits(permits);
+        return p;
+    }
+
+    public void updatePermit(Permit p, String permitNumber, LocalDate issueDate, LocalDate expiryDate)
+            throws InvalidInputException, DataFileException {
+        if (permitNumber == null || permitNumber.isBlank())
+            throw new InvalidInputException("Permit number is required.");
+        if (issueDate == null || expiryDate == null)
+            throw new InvalidInputException("Issue and expiry dates are required.");
+        if (!expiryDate.isAfter(issueDate))
+            throw new InvalidInputException("Expiry date must be after the issue date.");
+        p.setPermitNumber(clean(permitNumber));
+        p.setIssueDate(issueDate);
+        p.setExpiryDate(expiryDate);
+        fileHandler.savePermits(permits);
+    }
+
+    public void deletePermit(User actor, Permit p) throws InvalidInputException, DataFileException {
+        if (!actor.canDelete()) throw new InvalidInputException("Staff accounts cannot delete records.");
+        if (p == null) return;
+        permits.remove(p);
+        fileHandler.savePermits(permits);
+    }
+
     // ---------------------------------------------------------------- users
 
     public User addUser(User actor, String username, String password, String fullName, String role)
@@ -240,6 +371,18 @@ public class MarketManager {
         }
         users.remove(target);
         fileHandler.saveUsers(users);
+    }
+
+        // -------------------------------------------------------------- helpers
+
+    private void recalculatePaidUntil() {
+        for (Vendor v : vendors) v.setPaidUntil(null);
+        for (Payment p : payments) {
+            Vendor v = findVendor(p.getVendorId());
+            if (v != null && (v.getPaidUntil() == null || p.getPaidUntil().isAfter(v.getPaidUntil()))) {
+                v.setPaidUntil(p.getPaidUntil());
+            }
+        }
     }
 
     private String nextId(String prefix, Collection<String> ids) {
